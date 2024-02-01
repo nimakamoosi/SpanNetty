@@ -27,6 +27,8 @@ namespace DotNetty.Handlers.Tls
     using System.Diagnostics;
     using System.Runtime.CompilerServices;
     using System.Runtime.ExceptionServices;
+    using System.Net.Security;
+    using System.Threading;
     using System.Threading.Tasks;
     using DotNetty.Buffers;
     using DotNetty.Common.Concurrency;
@@ -38,23 +40,55 @@ namespace DotNetty.Handlers.Tls
 
     partial class TlsHandler
     {
-        private Task _lastContextWriteTask;
+        static readonly byte[] ZeroBuf = new byte[0];
+        
+        private IPromise _lastContextWritePromise;
+        private volatile int v_wrapDataSize = TlsUtils.MAX_PLAINTEXT_LENGTH;
+        
+#if NETCOREAPP_2_0_GREATER || NETSTANDARD_2_0_GREATER || NETSTANDARD2_0
+        private readonly Queue<IPromise> _asyncWritePromises = new Queue<IPromise>(10);
+        private Task _lastAsyncWrite; 
+#endif        
+
+        /// <summary>
+        /// Gets or Sets the number of bytes to pass to each <see cref="SslStream.Write(byte[], int, int)"/> call.
+        /// </summary>
+        /// <remarks>
+        /// This value will partition data which is passed to write
+        /// <see cref="Write(IChannelHandlerContext, object, IPromise)"/> The partitioning will work as follows:
+        /// <ul>
+        /// <li>If <code>wrapDataSize &lt;= 0</code> then we will write each data chunk as is.</li>
+        /// <li>If <code>wrapDataSize > data size</code> then we will attempt to aggregate multiple data chunks together.</li>
+        /// <li>Else if <code>wrapDataSize &lt;= data size</code> then we will divide the data into chunks of <c>wrapDataSize</c> when writing.</li>
+        /// </ul>
+        /// </remarks>
+        public int WrapDataSize
+        {
+            get => v_wrapDataSize;
+            set => v_wrapDataSize = value;
+        }
 
         public override void Write(IChannelHandlerContext context, object message, IPromise promise)
         {
-            if (message is IByteBuffer buf)
+            if (message is not IByteBuffer buf)
             {
-                if (_pendingUnencryptedWrites is object)
-                {
-                    _pendingUnencryptedWrites.Add(buf, promise);
-                }
-                else
-                {
-                    ReferenceCountUtil.SafeRelease(buf);
-                    _ = promise.TrySetException(NewPendingWritesNullException());
-                }
+                InvalidMessage(message, promise);
                 return;
             }
+            if (_pendingUnencryptedWrites is object)
+            {
+                _pendingUnencryptedWrites.Add(buf, promise);
+            }
+            else
+            {
+                ReferenceCountUtil.SafeRelease(buf);
+                _ = promise.TrySetException(NewPendingWritesNullException());
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void InvalidMessage(object message, IPromise promise)
+        {
             ReferenceCountUtil.SafeRelease(message);
             _ = promise.TrySetException(ThrowHelper.GetUnsupportedMessageTypeException(message));
         }
@@ -68,7 +102,7 @@ namespace DotNetty.Handlers.Tls
             catch (Exception cause)
             {
                 // Fail pending writes.
-                HandleFailure(cause);
+                HandleFailure(context, cause, true, false, true);
                 ExceptionDispatchInfo.Capture(cause).Throw();
             }
         }
@@ -88,7 +122,7 @@ namespace DotNetty.Handlers.Tls
 
         private void WrapAndFlush(IChannelHandlerContext context)
         {
-            if (_pendingUnencryptedWrites.IsEmpty)
+            if (_pendingUnencryptedWrites.IsEmpty())
             {
                 // It's important to NOT use a voidPromise here as the user
                 // may want to add a ChannelFutureListener to the ChannelPromise later.
@@ -97,7 +131,7 @@ namespace DotNetty.Handlers.Tls
                 _pendingUnencryptedWrites.Add(Unpooled.Empty, context.NewPromise());
             }
 
-            if (!EnsureAuthenticated(context))
+            if (!EnsureAuthenticationCompleted(context))
             {
                 State |= TlsHandlerState.FlushedBeforeHandshake;
                 return;
@@ -118,47 +152,62 @@ namespace DotNetty.Handlers.Tls
         {
             Debug.Assert(context == CapturedContext);
 
+            IByteBufferAllocator alloc = context.Allocator;
             IByteBuffer buf = null;
             try
             {
+                int wrapDataSize = v_wrapDataSize;
                 // Only continue to loop if the handler was not removed in the meantime.
                 // See https://github.com/netty/netty/issues/5860
                 while (!context.IsRemoved)
                 {
-                    List<object> messages = _pendingUnencryptedWrites.Current;
-                    if (messages is null || 0u >= (uint)messages.Count)
-                    {
-                        break;
-                    }
+                    var promise = context.NewPromise();
+                    buf = wrapDataSize > 0
+                        ? _pendingUnencryptedWrites.Remove(alloc, wrapDataSize, promise)
+                        : _pendingUnencryptedWrites.RemoveFirst(promise);
+                    if (buf is null) { break; }
 
-                    if (1u >= (uint)messages.Count) // messages.Count == 1; messages 最小数量为 1
+                    try
                     {
-                        buf = (IByteBuffer)messages[0];
-                    }
-                    else
-                    {
-                        buf = context.Allocator.Buffer((int)_pendingUnencryptedWrites.CurrentSize);
-                        for (int idx = 0; idx < messages.Count; idx++)
+                        var readableBytes = buf.ReadableBytes;
+                        if (buf is CompositeByteBuffer composite && !composite.IsSingleIoBuffer)
                         {
-                            var buffer = (IByteBuffer)messages[idx];
-                            _ = buffer.ReadBytes(buf, buffer.ReadableBytes);
-                            _ = buffer.Release();
+                            buf = context.Allocator.Buffer(readableBytes);
+                            _ = composite.ReadBytes(buf, readableBytes);
+                            composite.Release();
+                        }
+                        _lastContextWritePromise = promise;
+                        if (buf.IsReadable())
+                        {
+#if NETCOREAPP_2_0_GREATER || NETSTANDARD_2_0_GREATER
+                            var asyncWrite = WriteAsync(buf, promise);
+                            if (!asyncWrite.IsCompleted)
+                            {
+                                var asyncWriteTask = asyncWrite.AsTask();
+                                asyncWriteTask.Ignore();
+                                _lastAsyncWrite = asyncWriteTask;
+                            }
+                            buf = null; //prevent buf from releasing synchronously
+#else
+                            _ = buf.ReadBytes(_sslStream, readableBytes); // this leads to FinishWrap being called 0+ times
+#endif
+                        }
+                        else if (promise != null)
+                        {
+                            FinishWrap(ZeroBuf, 0, 0, promise);
                         }
                     }
-                    _ = buf.ReadBytes(_sslStream, buf.ReadableBytes); // this leads to FinishWrap being called 0+ times
-                    _ = buf.Release();
-                    buf = null;
-
-                    var promise = _pendingUnencryptedWrites.Remove();
-                    Task task = _lastContextWriteTask;
-                    if (task is object)
+                    catch (Exception exc)
                     {
-                        task.LinkOutcome(promise);
-                        _lastContextWriteTask = null;
+                        OnWriteFailure(exc, promise);
+                        throw;
                     }
-                    else
+                    finally
                     {
-                        _ = promise.TryComplete();
+                        buf?.Release();
+                        buf = null;
+                        promise = null;
+                        _lastContextWritePromise = null;
                     }
                 }
             }
@@ -186,7 +235,7 @@ namespace DotNetty.Handlers.Tls
                 output.Advance(bufLen);
             }
 
-            _lastContextWriteTask = capturedContext.WriteAsync(output, promise);
+            _ = capturedContext.WriteAsync(output, promise);
         }
 #endif
 
@@ -204,11 +253,11 @@ namespace DotNetty.Handlers.Tls
                 _ = output.WriteBytes(buffer, offset, count);
             }
 
-            _lastContextWriteTask = capturedContext.WriteAsync(output, promise);
+            _ = capturedContext.WriteAsync(output, promise);
         }
 
 #if NETCOREAPP || NETSTANDARD_2_0_GREATER
-        private Task FinishWrapNonAppDataAsync(in ReadOnlyMemory<byte> buffer, IPromise promise)
+        private Task FinishWrapAsync(in ReadOnlyMemory<byte> buffer, IPromise promise)
         {
             var capturedContext = CapturedContext;
             Task future;
@@ -225,14 +274,61 @@ namespace DotNetty.Handlers.Tls
         }
 #endif
 
-        private Task FinishWrapNonAppDataAsync(byte[] buffer, int offset, int count, IPromise promise)
+        private Task FinishWrapAsync(byte[] buffer, int offset, int count, IPromise promise)
         {
             var capturedContext = CapturedContext;
             var future = capturedContext.WriteAndFlushAsync(Unpooled.WrappedBuffer(buffer, offset, count), promise);
             this.ReadIfNeeded(capturedContext);
             return future;
         }
+        
+#if NETCOREAPP || NETSTANDARD_2_0_GREATER
+        private async ValueTask WriteAsync(IByteBuffer buf, IPromise promise)
+        {
+            var lastAsyncWrite = _lastAsyncWrite;
+            if (lastAsyncWrite != null && !lastAsyncWrite.IsCompletedSuccessfully)
+            {
+                try
+                {
+                    await lastAsyncWrite;
+                }
+                catch (Exception ex)
+                {
+                    //handle failure and propagate to the next pending write
+                    buf.Release();
+                    promise.TrySetException(ex);
+                    throw;
+                }
+            }
+            
+            try
+            {
+                _asyncWritePromises.Enqueue(promise);
+                var mem = buf.GetReadableMemory();
+                await _sslStream.WriteAsync(mem, CancellationToken.None); // this leads to FinishWrapAsync being called 0+ times
+                buf.AdvanceReader(mem.Length);
+            }
+            catch (Exception ex)
+            {
+                //handle failure and propagate to the next pending write
+                OnWriteFailure(ex, promise);
+                throw;
+            }
+            finally
+            {
+                buf.Release();
+            }
+        }
+#endif
 
+        private void OnWriteFailure(Exception ex, IPromise promise)
+        {
+            promise.TrySetException(ex);
+            // SslStream has been closed already.
+            // Any further write attempts should be denied.
+            _pendingUnencryptedWrites?.ReleaseAndFailAll(ex);
+        }
+        
         [MethodImpl(MethodImplOptions.NoInlining)]
         private static InvalidOperationException NewPendingWritesNullException()
         {
