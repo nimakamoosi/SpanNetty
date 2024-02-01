@@ -72,20 +72,19 @@ namespace HttpClient
                         //var channel = await bootstrap.ConnectAsync("httpbin.org", 443);
                         //var channel = await bootstrap.ConnectAsync(IPAddress.Parse("3.226.68.17"), 443);
                         Console.WriteLine("Connecting...");
-                        //var channel = await bootstrap.ConnectAsync(IPAddress.Loopback, 9091);
-                        var channel = await bootstrap.ConnectAsync(IPAddress.Loopback, 8081);
+                        var channel = await bootstrap.ConnectAsync(IPAddress.Loopback, 9091);
                         Console.WriteLine($"Connected: {channel}");
 
                         var body = Encoding.UTF8.GetBytes("abcdef");
 
                         var headers = new DefaultHttpHeaders(true);
 
-                        //headers.Add(HttpHeaderNames.Host, "localhost:9091");
-                        headers.Add(HttpHeaderNames.Host, "localhost:8081");
+                        headers.Add(HttpHeaderNames.Host, "localhost:9091");
                         headers.Add(HttpHeaderNames.ContentLength, body.Length);
 
                         //var req = new DefaultHttpRequest(HttpVersion.Http11, HttpMethod.Post, "/echo", headers);
-                        var req = new DefaultHttpRequest(HttpVersion.Http11, HttpMethod.Post, "/delayed-authentication", headers);
+                        var req = new DefaultHttpRequest(HttpVersion.Http11, HttpMethod.Post, "/delayed-authentication-echo", headers);
+
                         await channel.WriteAndFlushAsync(req);
                         Console.WriteLine("Request headers sent");
 
