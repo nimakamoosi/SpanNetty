@@ -82,7 +82,8 @@ namespace HttpClient
                         headers.Add(HttpHeaderNames.Host, "localhost:9091");
                         headers.Add(HttpHeaderNames.ContentLength, body.Length);
 
-                        var req = new DefaultHttpRequest(HttpVersion.Http11, HttpMethod.Post, "/echo", headers);
+                        //var req = new DefaultHttpRequest(HttpVersion.Http11, HttpMethod.Post, "/echo", headers);
+                        var req = new DefaultHttpRequest(HttpVersion.Http11, HttpMethod.Post, "/delayed-authentication-echo", headers);
                         await channel.WriteAndFlushAsync(req);
                         Console.WriteLine("Request headers sent");
 
