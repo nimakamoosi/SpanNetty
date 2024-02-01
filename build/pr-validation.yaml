@@ -3,14 +3,17 @@
 trigger:
   branches:
     include:
-      - future
-      - master
+      - main
+      - apimgateway
       - release/*
 
 pr:
   autoCancel: true # indicates whether additional pushes to a PR should cancel in-progress runs for the same PR. Defaults to true
   branches:
-    include: [ future, master, release/* ] # branch names which will trigger a build
+    include:  # branch names which will trigger a build
+    - main
+    - apimgateway
+    - release/*
 
 name: $(Year:yyyy).$(Month).$(DayOfMonth)$(Rev:.r)
 
@@ -26,10 +29,10 @@ jobs:
         submodules: recursive  # set to 'true' for a single level of submodules or 'recursive' to get submodules of submodules
         persistCredentials: true
       - task: UseDotNet@2
-        displayName: 'Use .NET Core SDK 5.0.203'
+        displayName: 'Use .NET Core SDK 5.0.302'
         inputs:
           packageType: sdk
-          version: 5.0.203
+          version: 5.0.302
       - task: BatchScript@1
         displayName: Windows Build
         inputs:
