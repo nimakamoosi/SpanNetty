@@ -8,6 +8,7 @@ parameters:
   scriptArgs: 'all'
   outputDirectory: ''
   timeoutInMinutes: 120
+  packageFeed: ''
 
 jobs:
   - job: ${{ parameters.name }}
@@ -16,13 +17,14 @@ jobs:
     pool:
       vmImage: ${{ parameters.vmImage }}
     steps:
-      - task: UseDotNet@2
-        displayName: 'Use .NET Core SDK 5.0.302'
-        inputs:
-          packageType: sdk
-          version: 5.0.302
+      - template: install-dotnet.yaml
+      - template: install-nuget.yaml
+      - template: restore-nuget-packages.yaml
+      - template: install-build-dependencies.yaml
+        parameters:
+          packageFeed: ${{ parameters.packageFeed }}
       - task: Bash@3 
-        displayName: Linux / OSX Build
+        displayName: Build (Linux)
         inputs:
           filePath: ${{ parameters.scriptFileName }}
           arguments: ${{ parameters.scriptArgs }}
@@ -30,18 +32,12 @@ jobs:
         condition: in( variables['Agent.OS'], 'Linux', 'Darwin' )
       # Windows
       - task: BatchScript@1
-        displayName: Windows Build
+        displayName: Build (Windows)
         inputs:
           filename: ${{ parameters.scriptFileName }}
           arguments: ${{ parameters.scriptArgs }}
         continueOnError: true
         condition: eq( variables['Agent.OS'], 'Windows_NT' )
-      - task: PublishTestResults@2
-        inputs:
-          testRunner: VSTest
-          testResultsFiles: '**/*.trx' #TestResults folder usually
-          testRunTitle: ${{ parameters.name }}
-          mergeTestResults: true
       - task: CopyFiles@2
         displayName: 'Copy Build Output'
         inputs:
@@ -49,7 +45,15 @@ jobs:
           contents: '**\*'
           targetFolder: $(Build.ArtifactStagingDirectory)
           continueOnError: boolean  # 'true' if future steps should run even if this step fails; defaults to 'false'
+      - task: PublishTestResults@2
+        displayName: 'Publish test results'
+        inputs:
+          testRunner: VSTest
+          testResultsFiles: '**/*.trx' #TestResults folder usually
+          testRunTitle: ${{ parameters.name }}
+          mergeTestResults: true
+          failTaskOnFailedTests: false
       - script: 'echo 1>&2'
         failOnStderr: true
-        displayName: 'If above is partially succeeded, then fail'
+        displayName: 'Fail job when previous task(s) failed'
         condition: eq(variables['Agent.JobStatus'], 'SucceededWithIssues')
